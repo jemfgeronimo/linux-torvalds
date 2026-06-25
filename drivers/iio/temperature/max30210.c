@@ -5,6 +5,7 @@
  * Copyright 2026 Analog Devices Inc.
  */
 
+#include <linux/bitfield.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/iio/buffer.h>
@@ -13,6 +14,7 @@
 #include <linux/iio/kfifo_buf.h>
 #include <linux/iio/sysfs.h>
 #include <linux/regmap.h>
+#include <linux/unaligned.h>
 #include <linux/units.h>
 
 #define MAX30210_STATUS_REG		0x00
@@ -42,7 +44,8 @@
 #define MAX30210_STATUS_TEMP_HI_MASK  BIT(2)
 #define MAX30210_STATUS_PWR_RDY_MASK  BIT(0)
 
-#define MAX30210_FIFOCONF1_FLUSH_FIFO_MASK BIT(4)
+#define MAX30210_FIFOCONF1_A_FULL_MASK		GENMASK(5, 0)
+#define MAX30210_FIFOCONF1_FLUSH_FIFO_MASK	BIT(4)
 
 #define MAX30210_SYSCONF_RESET_MASK		BIT(0)
 
@@ -61,8 +64,10 @@
 #define MAX30210_TEMPCONV_CONV_T_MASK	BIT(0)
 
 #define MAX30210_PART_ID		0x45
-#define MAX30210_FIFO_SIZE		64
-#define MAX30210_FIFO_INVAL_DATA	GENMASK(23, 0)
+#define MAX30210_FIFO_SIZE			64
+#define MAX30210_FIFO_BYTES_PER_SAMPLE		3
+#define MAX30210_FIFO_TEMP_MASK			GENMASK(15, 0)
+#define MAX30210_FIFO_INVAL_DATA		GENMASK(23, 0)
 #define MAX30210_WATERMARK_DEFAULT	(0x40 - 0x1F)
 
 #define MAX30210_UNIQUE_ID_LEN		6
@@ -72,8 +77,8 @@
 struct max30210_state {
 	struct regmap *regmap;
 	u8 watermark;
-	/* Raw FIFO byte buffer (3 bytes per sample) */
-	u8 fifo_buf[3 * MAX30210_FIFO_SIZE];
+	/* Raw FIFO byte buffer */
+	u8 fifo_buf[MAX30210_FIFO_BYTES_PER_SAMPLE * MAX30210_FIFO_SIZE];
 };
 
 static const int max30210_samp_freq_avail[][2] = {
@@ -126,21 +131,22 @@ static void max30210_fifo_read(struct iio_dev *indio_dev)
 	int ret;
 
 	ret = regmap_bulk_read(st->regmap, MAX30210_FIFO_DATA_REG,
-			       st->fifo_buf, 3 * st->watermark);
+			       st->fifo_buf,
+			       MAX30210_FIFO_BYTES_PER_SAMPLE * st->watermark);
 	if (ret) {
 		dev_err(&indio_dev->dev, "Failed to read from fifo.\n");
 		return;
 	}
 
 	for (unsigned int i = 0; i < st->watermark; i++) {
-		u32 raw = get_unaligned_be24(&st->fifo_buf[3 * i]);
+		u32 raw = get_unaligned_be24(&st->fifo_buf[MAX30210_FIFO_BYTES_PER_SAMPLE * i]);
 
 		if (raw == MAX30210_FIFO_INVAL_DATA) {
 			dev_err_ratelimited(&indio_dev->dev, "Invalid data\n");
 			continue;
 		}
 
-		s16 temp = (s16)(raw & 0xFFFF);
+		s16 temp = (s16)FIELD_GET(MAX30210_FIFO_TEMP_MASK, raw);
 
 		iio_push_to_buffers(indio_dev, &temp);
 	}
@@ -184,10 +190,10 @@ static int max30210_reg_access(struct iio_dev *indio_dev, unsigned int reg,
 {
 	struct max30210_state *st = iio_priv(indio_dev);
 
-	if (!readval)
-		return regmap_write(st->regmap, reg, writeval);
+	if (readval)
+		return regmap_read(st->regmap, reg, readval);
 
-	return regmap_read(st->regmap, reg, readval);
+	return regmap_write(st->regmap, reg, writeval);
 }
 
 static int max30210_read_event(struct iio_dev *indio_dev,
@@ -230,6 +236,9 @@ static int max30210_write_event(struct iio_dev *indio_dev,
 	struct max30210_state *st = iio_priv(indio_dev);
 
 	if (info != IIO_EV_INFO_VALUE)
+		return -EINVAL;
+
+	if (val < S16_MIN || val > S16_MAX)
 		return -EINVAL;
 
 	switch (dir) {
@@ -335,16 +344,19 @@ static int max30210_read_raw(struct iio_dev *indio_dev,
 
 		uval = FIELD_GET(MAX30210_TEMPCONF2_TEMP_PERIOD_MASK, uval);
 
-		if (uval >= ARRAY_SIZE(max30210_samp_freq_avail))
-			uval = ARRAY_SIZE(max30210_samp_freq_avail) - 1;
+		/*
+		 * TEMP_PERIOD is an index into the sampling frequency lookup
+		 * table. Clamp in case the register holds a reserved value.
+		 */
+		uval = min_t(unsigned int, uval, ARRAY_SIZE(max30210_samp_freq_avail) - 1);
 
 		*val = max30210_samp_freq_avail[uval][0];
 		*val2 = max30210_samp_freq_avail[uval][1];
 
-		return IIO_VAL_FRACTIONAL;
+		return IIO_VAL_INT_PLUS_MICRO;
 	case IIO_CHAN_INFO_RAW: {
 		if (iio_buffer_enabled(indio_dev))
-			return max30210_read_temp(st->regmap, MAX30210_TEMP_DATA_REG, val);
+			return -EBUSY;
 
 		IIO_DEV_ACQUIRE_DIRECT_MODE(indio_dev, claim);
 		if (IIO_DEV_ACQUIRE_FAILED(claim))
@@ -411,12 +423,13 @@ static int max30210_write_raw(struct iio_dev *indio_dev,
 			return -EINVAL;
 
 		for (unsigned int i = 0; i < ARRAY_SIZE(max30210_samp_freq_avail); i++) {
-			if (val == max30210_samp_freq_avail[i][0] &&
-			    val2 == max30210_samp_freq_avail[i][1]) {
-				return regmap_update_bits(st->regmap, MAX30210_TEMP_CONF_2_REG,
-						MAX30210_TEMPCONF2_TEMP_PERIOD_MASK,
-						FIELD_PREP(MAX30210_TEMPCONF2_TEMP_PERIOD_MASK, i));
-			}
+			if (val != max30210_samp_freq_avail[i][0] ||
+			    val2 != max30210_samp_freq_avail[i][1])
+				continue;
+
+			return regmap_update_bits(st->regmap, MAX30210_TEMP_CONF_2_REG,
+					MAX30210_TEMPCONF2_TEMP_PERIOD_MASK,
+					FIELD_PREP(MAX30210_TEMPCONF2_TEMP_PERIOD_MASK, i));
 		}
 
 		return -EINVAL;
@@ -429,15 +442,19 @@ static int max30210_write_raw(struct iio_dev *indio_dev,
 static int max30210_set_watermark(struct iio_dev *indio_dev, unsigned int val)
 {
 	struct max30210_state *st = iio_priv(indio_dev);
-	unsigned int reg;
 	int ret;
 
 	if (val < 1 || val > MAX30210_FIFO_SIZE)
 		return -EINVAL;
 
-	reg = MAX30210_FIFO_SIZE - val;
-
-	ret = regmap_write(st->regmap, MAX30210_FIFO_CONF_1_REG, reg);
+	/*
+	 * FIFO_A_FULL sets the number of empty FIFO slots remaining when the
+	 * A_FULL interrupt fires. For a watermark of N samples, set
+	 * FIFO_A_FULL = FIFO_SIZE - N.
+	 */
+	ret = regmap_write(st->regmap, MAX30210_FIFO_CONF_1_REG,
+			   FIELD_PREP(MAX30210_FIFOCONF1_A_FULL_MASK,
+				      MAX30210_FIFO_SIZE - val));
 	if (ret)
 		return ret;
 
@@ -472,15 +489,19 @@ static int max30210_buffer_preenable(struct iio_dev *indio_dev)
 	struct max30210_state *st = iio_priv(indio_dev);
 	int ret;
 
-	ret = regmap_set_bits(st->regmap, MAX30210_INT_EN_REG, MAX30210_STATUS_A_FULL_MASK);
+	/* Enable FIFO-full interrupt */
+	ret = regmap_set_bits(st->regmap, MAX30210_INT_EN_REG,
+			      MAX30210_STATUS_A_FULL_MASK);
 	if (ret)
 		return ret;
 
+	/* Flush FIFO before starting autonomous conversions */
 	ret = regmap_set_bits(st->regmap, MAX30210_FIFO_CONF_2_REG,
 			      MAX30210_FIFOCONF1_FLUSH_FIFO_MASK);
 	if (ret)
 		return ret;
 
+	/* Start autonomous temperature conversion */
 	return regmap_write(st->regmap, MAX30210_TEMP_CONV_REG,
 			    MAX30210_TEMPCONV_AUTO_MASK | MAX30210_TEMPCONV_CONV_T_MASK);
 }
@@ -490,15 +511,18 @@ static int max30210_buffer_postdisable(struct iio_dev *indio_dev)
 	struct max30210_state *st = iio_priv(indio_dev);
 	int ret;
 
+	/* Stop autonomous conversion */
 	ret = regmap_write(st->regmap, MAX30210_TEMP_CONV_REG, 0x0);
 	if (ret)
 		return ret;
 
+	/* Flush FIFO */
 	ret = regmap_set_bits(st->regmap, MAX30210_FIFO_CONF_2_REG,
 			      MAX30210_FIFOCONF1_FLUSH_FIFO_MASK);
 	if (ret)
 		return ret;
 
+	/* Disable FIFO-full interrupt */
 	return regmap_clear_bits(st->regmap, MAX30210_INT_EN_REG,
 				 MAX30210_STATUS_A_FULL_MASK);
 }
@@ -532,7 +556,7 @@ static const struct iio_event_spec max30210_events[] = {
 	},
 };
 
-static const struct iio_chan_spec max30210_channels = {
+static const struct iio_chan_spec max30210_channel = {
 	.type = IIO_TEMP,
 	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
 			      BIT(IIO_CHAN_INFO_SCALE) |
@@ -545,7 +569,6 @@ static const struct iio_chan_spec max30210_channels = {
 		.sign = 's',
 		.realbits = 16,
 		.storagebits = 16,
-		.shift = 0,
 		.endianness = IIO_CPU,
 	},
 };
@@ -568,14 +591,14 @@ static int max30210_setup(struct max30210_state *st, struct device *dev)
 		gpiod_set_value(powerdown_gpio, 0);
 	} else {
 		/* Software reset fallback */
-		ret = regmap_update_bits(st->regmap, MAX30210_SYS_CONF_REG,
-					 MAX30210_SYSCONF_RESET_MASK,
-					 MAX30210_SYSCONF_RESET_MASK);
+		ret = regmap_set_bits(st->regmap, MAX30210_SYS_CONF_REG,
+				      MAX30210_SYSCONF_RESET_MASK);
 		if (ret)
 			return ret;
 	}
 
-	/* Datasheet Figure 6:
+	/*
+	 * Datasheet Figure 6:
 	 * tPU max = 700 µs after power-up or reset before device is ready.
 	 */
 	fsleep(700);
@@ -617,7 +640,7 @@ static int max30210_probe(struct i2c_client *client)
 		return ret;
 
 	indio_dev->modes = INDIO_DIRECT_MODE;
-	indio_dev->channels = &max30210_channels;
+	indio_dev->channels = &max30210_channel;
 	indio_dev->num_channels = 1;
 	indio_dev->name = "max30210";
 	indio_dev->info = &max30210_info;
@@ -627,12 +650,14 @@ static int max30210_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	if (client->irq) {
-		ret = devm_request_irq(dev, client->irq, max30210_irq_handler, IRQF_NO_THREAD,
-				       indio_dev->name, indio_dev);
-		if (ret)
-			return ret;
-	}
+	if (!client->irq)
+		return dev_err_probe(dev, -ENXIO, "Missing interrupt.\n");
+
+	ret = devm_request_threaded_irq(dev, client->irq, NULL,
+					max30210_irq_handler, IRQF_ONESHOT,
+					indio_dev->name, indio_dev);
+	if (ret)
+		return ret;
 
 	return devm_iio_device_register(dev, indio_dev);
 }
@@ -659,6 +684,6 @@ static struct i2c_driver max30210_driver = {
 };
 module_i2c_driver(max30210_driver);
 
-MODULE_AUTHOR("John Erasmus Mari Geronimo <johnerasmusmari.geronimo@analog.com");
+MODULE_AUTHOR("John Erasmus Mari Geronimo <johnerasmusmari.geronimo@analog.com>");
 MODULE_DESCRIPTION("MAX30210 low-power digital temperature sensor");
 MODULE_LICENSE("GPL");

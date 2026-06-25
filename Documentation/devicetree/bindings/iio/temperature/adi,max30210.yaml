@@ -22,8 +22,7 @@ properties:
   reg:
     maxItems: 1
 
-  vdd-supply:
-    description: Analog supply voltage input.
+  vdd-supply: true
 
   powerdown-gpios:
     description: GPIO connected to the CVT/PDB pin (active low).
