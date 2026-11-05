@@ -721,6 +721,9 @@ static int max30210_setup(struct max30210_state *st, struct device *dev)
 				     "failed to request powerdown GPIO\n");
 
 	if (powerdown_gpio) {
+		/* CVT/PDB needs a 5 us low pulse; hold it asserted for twice that. */
+		fsleep(10);
+
 		/* Deassert powerdown to power up device */
 		gpiod_set_value_cansleep(powerdown_gpio, 0);
 
