@@ -183,7 +183,10 @@ static int max30210_autoconv_put(struct max30210_state *st)
 
 	lockdep_assert_held(&st->lock);
 
-	/* Drop the reference even if the write fails; a later direct read clears AUTO anyway. */
+	/*
+	 * Drop the reference even if the write fails;
+	 * a later direct read clears AUTO anyway.
+	 */
 	if (st->autoconv_users == 1)
 		ret = regmap_write(st->regmap, MAX30210_TEMP_CONV_REG, 0);
 	if (st->autoconv_users)
@@ -205,12 +208,13 @@ static void max30210_fifo_read(struct iio_dev *indio_dev)
 				st->fifo_buf,
 				MAX30210_FIFO_BYTES_PER_SAMPLE * st->watermark);
 	if (ret) {
-		dev_err(&indio_dev->dev, "Failed to read from fifo.\n");
+		dev_err_ratelimited(&indio_dev->dev, "Failed to read from fifo.\n");
 		return;
 	}
 
 	for (unsigned int i = 0; i < st->watermark; i++) {
-		u32 raw = get_unaligned_be24(&st->fifo_buf[MAX30210_FIFO_BYTES_PER_SAMPLE * i]);
+		unsigned int idx = MAX30210_FIFO_BYTES_PER_SAMPLE * i;
+		u32 raw = get_unaligned_be24(&st->fifo_buf[idx]);
 		s16 temp;
 
 		if (raw == MAX30210_FIFO_INVAL_DATA) {
@@ -233,14 +237,14 @@ static irqreturn_t max30210_irq_handler(int irq, void *dev_id)
 
 	ret = regmap_read(st->regmap, MAX30210_STATUS_REG, &status);
 	if (ret) {
-		dev_err(&indio_dev->dev, "Status read failed\n");
+		dev_err_ratelimited(&indio_dev->dev, "Status read failed\n");
 		return IRQ_NONE;
 	}
 
 	/* STATUS flags are set whether or not they are enabled in INT_EN. */
 	ret = regmap_read(st->regmap, MAX30210_INT_EN_REG, &enabled);
 	if (ret) {
-		dev_err(&indio_dev->dev, "Interrupt enable read failed\n");
+		dev_err_ratelimited(&indio_dev->dev, "Interrupt enable read failed\n");
 		return IRQ_NONE;
 	}
 
@@ -514,6 +518,7 @@ static int max30210_write_raw(struct iio_dev *indio_dev,
 			      int val, int val2, long mask)
 {
 	struct max30210_state *st = iio_priv(indio_dev);
+	struct regmap *map = st->regmap;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ: {
@@ -525,13 +530,14 @@ static int max30210_write_raw(struct iio_dev *indio_dev,
 			return -EBUSY;
 
 		for (unsigned int i = 0; i < ARRAY_SIZE(max30210_samp_freq_avail); i++) {
+			u32 m = MAX30210_TEMPCONF2_TEMP_PERIOD_MASK;
+			u32 v = field_prep(m, i);
+
 			if (val != max30210_samp_freq_avail[i][0] ||
 			    val2 != max30210_samp_freq_avail[i][1])
 				continue;
 
-			return regmap_update_bits(st->regmap, MAX30210_TEMP_CONF_2_REG,
-					MAX30210_TEMPCONF2_TEMP_PERIOD_MASK,
-					FIELD_PREP(MAX30210_TEMPCONF2_TEMP_PERIOD_MASK, i));
+			return regmap_update_bits(map, MAX30210_TEMP_CONF_2_REG, m, v);
 		}
 
 		return -EINVAL;
@@ -546,10 +552,9 @@ static int max30210_set_watermark(struct iio_dev *indio_dev, unsigned int val)
 	struct max30210_state *st = iio_priv(indio_dev);
 	int ret;
 
+	val = min(val, MAX30210_FIFO_SIZE);
 	if (!val)
 		return -EINVAL;
-
-	val = min(val, MAX30210_FIFO_SIZE);
 
 	/*
 	 * FIFO_A_FULL sets the number of empty FIFO slots remaining when
@@ -606,15 +611,23 @@ static int max30210_buffer_postenable(struct iio_dev *indio_dev)
 
 	guard(mutex)(&st->lock);
 
+	/*
+	 * Clear a stale A_FULL so it cannot fire on the flushed FIFO. With
+	 * no autoconv user no threshold event is armed, so STATUS holds
+	 * nothing worth keeping; otherwise leave it for the IRQ handler.
+	 */
+	if (!st->autoconv_users) {
+		ret = regmap_read(st->regmap, MAX30210_STATUS_REG, &status);
+		if (ret)
+			return ret;
+	}
+
 	ret = max30210_autoconv_get(st);
 	if (ret)
 		return ret;
 
-	/* Read STATUS to clear a stale A_FULL so it cannot fire on the flushed FIFO. */
-	ret = regmap_read(st->regmap, MAX30210_STATUS_REG, &status);
-	if (!ret)
-		ret = regmap_set_bits(st->regmap, MAX30210_INT_EN_REG,
-				      MAX30210_STATUS_A_FULL_MASK);
+	ret = regmap_set_bits(st->regmap, MAX30210_INT_EN_REG,
+			      MAX30210_STATUS_A_FULL_MASK);
 	if (ret)
 		max30210_autoconv_put(st);
 
@@ -721,7 +734,7 @@ static int max30210_setup(struct max30210_state *st, struct device *dev)
 				     "failed to request powerdown GPIO\n");
 
 	if (powerdown_gpio) {
-		/* CVT/PDB needs a 5 us low pulse; hold it asserted for twice that. */
+		/* CVT/PDB needs a 5 µs low pulse; hold it asserted for twice that. */
 		fsleep(10);
 
 		/* Deassert powerdown to power up device */
@@ -804,26 +817,19 @@ static int max30210_probe(struct i2c_client *client)
 		if (ret)
 			return ret;
 
-		/* Runs after unregister, so nothing can re-arm the device; before powerdown. */
+		/* Runs after the IRQ is freed and the device unregistered; before powerdown. */
 		ret = devm_add_action_or_reset(dev, max30210_quiesce, st);
+		if (ret)
+			return ret;
+
+		ret = devm_request_threaded_irq(dev, client->irq, NULL,
+						max30210_irq_handler, IRQF_ONESHOT,
+						indio_dev->name, indio_dev);
 		if (ret)
 			return ret;
 	}
 
-	ret = devm_iio_device_register(dev, indio_dev);
-	if (ret)
-		return ret;
-
-	if (!client->irq)
-		return 0;
-
-	/*
-	 * Request the IRQ after registering the IIO device so devm tears it
-	 * down first on removal, before the event interface is freed.
-	 */
-	return devm_request_threaded_irq(dev, client->irq, NULL,
-					 max30210_irq_handler, IRQF_ONESHOT,
-					 indio_dev->name, indio_dev);
+	return devm_iio_device_register(dev, indio_dev);
 }
 
 static const struct i2c_device_id max30210_id[] = {
